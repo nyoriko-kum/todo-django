@@ -7,45 +7,110 @@ pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  imageName: 'mywebapp-image'
-  resourceGroup: 'test-CICD'
-  vmssName: 'test-vmss'
+  # ACR
+  acrName: 'myacr123'                      # ← あなたのACR名
+  acrLoginServer: 'myacr123.azurecr.io'    # ← 上と合わせる
+  imageTag: '$(Build.BuildId)'
+
+  # Azureリソース
+  resourceGroup: 'test-CICD'               # ← あなたのRG
+  vmssName: 'test-vmss'                    # ← デプロイしたいVMSS名
+
+  # 画像名（ACR内での名前）
+  djangoImage: 'django-app'
+  nginxImage: 'nginx-app'
+  mysqlImage: 'mysql-app'
 
 steps:
   # ① ソース取得
   - task: Checkout@1
 
-  # ② アプリのビルド
-  - task: DotNetCoreCLI@2
+  # ② DockerでアプリをビルドしてACRにpush
+  #   ※ここでは3つのイメージを別々にpushしています
+  - task: Docker@2
+    displayName: 'Build & Push Django'
     inputs:
-      command: 'publish'
-      projects: '**/*.csproj'
-      arguments: '--configuration Release --output $(Build.ArtifactStagingDirectory)/publish'
+      containerRegistry: 'MyServiceConnection'   # ACRへのService connection
+      repository: '$(djangoImage)'
+      command: 'buildAndPush'
+      dockerfile: 'docker/django/Dockerfile'
+      tags: |
+        $(imageTag)
+        latest
 
-  # ③ Managed Image を作成
-  - task: AzureCLI@2
+  - task: Docker@2
+    displayName: 'Build & Push Nginx'
     inputs:
-      azureSubscription: 'MyServiceConnection'   # サービス接続名
-      scriptType: 'bash'
-      scriptLocation: 'inlineScript'
-      inlineScript: |
-        az image create \
-          --resource-group $(resourceGroup) \
-          --name $(imageName)-$(Build.BuildId) \
-          --source $(vmssName)
+      containerRegistry: 'MyServiceConnection'
+      repository: '$(nginxImage)'
+      command: 'buildAndPush'
+      dockerfile: 'docker/nginx/Dockerfile'
+      tags: |
+        $(imageTag)
+        latest
 
-  # ④ VMSS のローリングアップデート
+  - task: Docker@2
+    displayName: 'Build & Push MySQL'
+    inputs:
+      containerRegistry: 'MyServiceConnection'
+      repository: '$(mysqlImage)'
+      command: 'buildAndPush'
+      dockerfile: 'docker/mysql/Dockerfile'
+      tags: |
+        $(imageTag)
+        latest
+
+  # ③ VMSS の中で docker compose を叩かせる
+  #    → VMSS の各VMに「最新イメージをpullして起動し直して」と言う
+  #    ここが“Managed Imageつくる” の代わりになるところ
   - task: AzureCLI@2
+    displayName: 'Update VMSS instances (pull & restart containers)'
     inputs:
       azureSubscription: 'MyServiceConnection'
       scriptType: 'bash'
       scriptLocation: 'inlineScript'
       inlineScript: |
-        az vmss update \
+        # VMSS 内で実行させたいシェルをここに書く
+        # 今回は「ACRログイン→最新の3コンテナpull→docker compose up -d」みたいなことを想定
+        # ポイント：これは"VMSSの各インスタンス"で動きます
+
+        # 1) ACRのパスワードなどを取得（Managed IdentityでやるならここをMI用に変える）
+        ACR_LOGIN_SERVER=$(echo $(acrName) | sed 's/$/.azurecr.io/')
+        echo "ACR: $ACR_LOGIN_SERVER"
+
+        # 2) VMSSの全インスタンスに対してスクリプトを実行
+        #    ※ このコマンドは各VMで /bin/bash が実行されます
+        az vmss run-command invoke \
           --resource-group $(resourceGroup) \
           --name $(vmssName) \
-          --set virtualMachineProfile.storageProfile.imageReference.id=$(az image show -g $(resourceGroup) -n $(imageName)-$(Build.BuildId) --query id -o tsv)
+          --command-id RunShellScript \
+          --scripts "
+            # ACRにログイン（Service Principalの権限がある前提）
+            az acr login --name $(acrName)
 
-        az vmss rolling-upgrade start \
-          --resource-group $(resourceGroup) \
-          --name $(vmssName)
+            # 最新イメージをpull
+            docker pull $(acrLoginServer)/$(djangoImage):latest
+            docker pull $(acrLoginServer)/$(nginxImage):latest
+            docker pull $(acrLoginServer)/$(mysqlImage):latest
+
+            # もし docker-compose.yml をVMに配置してあるならそれを起動
+            if [ -f /opt/app/docker-compose.yml ]; then
+              cd /opt/app
+              docker compose down || true
+              docker compose up -d
+            else
+              # composeがない場合は個別に起動する例
+              docker stop django || true
+              docker rm django || true
+              docker run -d --name django --network app-net $(acrLoginServer)/$(djangoImage):latest
+
+              docker stop nginx || true
+              docker rm nginx || true
+              docker run -d --name nginx --network app-net -p 80:80 $(acrLoginServer)/$(nginxImage):latest
+
+              docker stop mysql || true
+              docker rm mysql || true
+              docker run -d --name mysql --network app-net -e MYSQL_ROOT_PASSWORD=Passw0rd! $(acrLoginServer)/$(mysqlImage):latest
+            fi
+          "
+
