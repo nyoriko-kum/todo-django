@@ -1,0 +1,51 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  imageName: 'mywebapp-image'
+  resourceGroup: 'test-CICD'
+  vmssName: 'test-vmss'
+
+steps:
+  # ① ソース取得
+  - task: Checkout@1
+
+  # ② アプリのビルド
+  - task: DotNetCoreCLI@2
+    inputs:
+      command: 'publish'
+      projects: '**/*.csproj'
+      arguments: '--configuration Release --output $(Build.ArtifactStagingDirectory)/publish'
+
+  # ③ Managed Image を作成
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: 'MyServiceConnection'   # サービス接続名
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az image create \
+          --resource-group $(resourceGroup) \
+          --name $(imageName)-$(Build.BuildId) \
+          --source $(vmssName)
+
+  # ④ VMSS のローリングアップデート
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: 'MyServiceConnection'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az vmss update \
+          --resource-group $(resourceGroup) \
+          --name $(vmssName) \
+          --set virtualMachineProfile.storageProfile.imageReference.id=$(az image show -g $(resourceGroup) -n $(imageName)-$(Build.BuildId) --query id -o tsv)
+
+        az vmss rolling-upgrade start \
+          --resource-group $(resourceGroup) \
+          --name $(vmssName)
