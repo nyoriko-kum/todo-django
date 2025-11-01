@@ -23,7 +23,7 @@ variables:
 
 steps:
   # ① ソース取得
-  - task: Checkout@1
+  - checkout: self
 
   # ② DockerでアプリをビルドしてACRにpush
   #   ※ここでは3つのイメージを別々にpushしています
