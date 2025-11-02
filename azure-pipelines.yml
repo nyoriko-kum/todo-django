@@ -4,61 +4,37 @@ trigger:
       - main
 
 pool:
-  vmImage: 'ubuntu-latest'
+  name: 'nameagent-pool'
 
 variables:
   # ACR
-  acrName: 'myacr123'                      # ← あなたのACR名
-  acrLoginServer: 'myacr123.azurecr.io'    # ← 上と合わせる
+  acrName: 'test'                      # ← あなたのACR名
+  acrLoginServer: 'test.azurecr.io'    # ← 上と合わせる
   imageTag: '$(Build.BuildId)'
 
   # Azureリソース
   resourceGroup: 'test-CICD'               # ← あなたのRG
   vmssName: 'test-vmss'                    # ← デプロイしたいVMSS名
 
-  # 画像名（ACR内での名前）
-  djangoImage: 'django-app'
-  nginxImage: 'nginx-app'
-  mysqlImage: 'mysql-app'
-
 steps:
   # ① ソース取得
   - checkout: self
 
-  # ② DockerでアプリをビルドしてACRにpush
-  #   ※ここでは3つのイメージを別々にpushしています
+  # ② ACRにログイン
   - task: Docker@2
-    displayName: 'Build & Push Django'
+    displayName: 'Login to ACR'
     inputs:
-      containerRegistry: 'MyServiceConnection'   # ACRへのService connection
-      repository: '$(djangoImage)'
-      command: 'buildAndPush'
-      dockerfile: 'docker/django/Dockerfile'
-      tags: |
-        $(imageTag)
-        latest
+      command: login
+      containerRegistry: 'MyDockerConnection'
 
-  - task: Docker@2
-    displayName: 'Build & Push Nginx'
-    inputs:
-      containerRegistry: 'MyServiceConnection'
-      repository: '$(nginxImage)'
-      command: 'buildAndPush'
-      dockerfile: 'docker/nginx/Dockerfile'
-      tags: |
-        $(imageTag)
-        latest
+  # ③ docker-compose で一括ビルド & push
+  - script: |
+      echo "=== Building & pushing images via docker-compose ==="
 
-  - task: Docker@2
-    displayName: 'Build & Push MySQL'
-    inputs:
-      containerRegistry: 'MyServiceConnection'
-      repository: '$(mysqlImage)'
-      command: 'buildAndPush'
-      dockerfile: 'docker/mysql/Dockerfile'
-      tags: |
-        $(imageTag)
-        latest
+      # docker-compose.yml の中で image: に ACR パスが設定されている前提
+      docker compose build
+      docker compose push
+    displayName: 'Build & Push with Docker Compose'
 
   # ③ VMSS の中で docker compose を叩かせる
   #    → VMSS の各VMに「最新イメージをpullして起動し直して」と言う
@@ -85,32 +61,12 @@ steps:
           --name $(vmssName) \
           --command-id RunShellScript \
           --scripts "
-            # ACRにログイン（Service Principalの権限がある前提）
+          　echo '=== Updating containers on VMSS ==='
             az acr login --name $(acrName)
-
-            # 最新イメージをpull
-            docker pull $(acrLoginServer)/$(djangoImage):latest
-            docker pull $(acrLoginServer)/$(nginxImage):latest
-            docker pull $(acrLoginServer)/$(mysqlImage):latest
-
-            # もし docker-compose.yml をVMに配置してあるならそれを起動
-            if [ -f /opt/app/docker-compose.yml ]; then
-              cd /opt/app
-              docker compose down || true
-              docker compose up -d
-            else
-              # composeがない場合は個別に起動する例
-              docker stop django || true
-              docker rm django || true
-              docker run -d --name django --network app-net $(acrLoginServer)/$(djangoImage):latest
-
-              docker stop nginx || true
-              docker rm nginx || true
-              docker run -d --name nginx --network app-net -p 80:80 $(acrLoginServer)/$(nginxImage):latest
-
-              docker stop mysql || true
-              docker rm mysql || true
-              docker run -d --name mysql --network app-net -e MYSQL_ROOT_PASSWORD=Passw0rd! $(acrLoginServer)/$(mysqlImage):latest
-            fi
+            cd /opt/app
+            docker compose pull
+            docker compose down
+            docker compose up -d
           "
+
 
